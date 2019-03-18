@@ -25,7 +25,7 @@ pub trait ApexCommitment<E: JubjubEngine> {
         );
         let mut preimage_boolean = Vec::new();
 
-        for (i, comm) in (&allocated_nums).into_iter().enumerate() {
+        for (i, comm) in (&allocated_nums).iter().enumerate() {
             preimage_boolean
                 .extend(comm.into_bits_le(cs.namespace(|| format!("preimage-bits-{}", i)))?);
             // sad padding is sad
@@ -102,7 +102,8 @@ impl<E: JubjubEngine> ApexCommitment<E> for BinaryApexCommitment<E> {
         let cs = &mut cs.namespace(|| "binary_commitment_inclusion");
         let num_at_path = self.at_path(cs, path)?;
 
-        Ok(constraint::equal(cs, annotation, num, &num_at_path))
+        constraint::equal(cs, annotation, num, &num_at_path);
+        Ok(())
     }
 }
 
@@ -187,12 +188,8 @@ impl<E: JubjubEngine> ApexCommitment<E> for FlatApexCommitment<E> {
         if path.is_empty() {
             assert_eq!(size, 1);
 
-            Ok(constraint::equal(
-                cs,
-                annotation,
-                num,
-                &self.allocated_nums[0],
-            ))
+            constraint::equal(cs, annotation, num, &self.allocated_nums[0]);
+            Ok(())
         } else {
             let reduced_size = size / 2; // Must divide evenly because size must be power of 2.
             let mut new_allocated = Vec::with_capacity(reduced_size);
