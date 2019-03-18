@@ -1,13 +1,48 @@
 use bellman::{ConstraintSystem, SynthesisError};
-use pairing::Engine;
 use sapling_crypto::circuit::boolean::Boolean;
 use sapling_crypto::circuit::num;
 use sapling_crypto::circuit::num::AllocatedNum;
+use sapling_crypto::jubjub::JubjubEngine;
 
-use crate::circuit::constraint::equal;
+use crate::circuit::constraint;
+use crate::circuit::pedersen::pedersen_md_no_padding;
 
-pub trait ApexCommitment<E: Engine> {
+pub trait ApexCommitment<E: JubjubEngine> {
     fn new(allocated_nums: &[AllocatedNum<E>]) -> Self;
+
+    fn commit<CS: ConstraintSystem<E>>(
+        cs: &mut CS,
+        allocated_nums: &[AllocatedNum<E>],
+        params: &E::Params,
+    ) -> Result<(Self, AllocatedNum<E>), SynthesisError>
+    where
+        Self: Sized,
+    {
+        // pedersen_md_no_padding requires at least two elements
+        assert!(
+            allocated_nums.len() > 1,
+            "cannot commit only a single value"
+        );
+        let mut preimage_boolean = Vec::new();
+
+        for (i, comm) in (&allocated_nums).into_iter().enumerate() {
+            preimage_boolean
+                .extend(comm.into_bits_le(cs.namespace(|| format!("preimage-bits-{}", i)))?);
+            // sad padding is sad
+            while preimage_boolean.len() % 256 != 0 {
+                preimage_boolean.push(Boolean::Constant(false));
+            }
+        }
+
+        // Calculate the pedersen hash.
+        let computed_commitment = pedersen_md_no_padding(
+            cs.namespace(|| "apex-commitment"),
+            params,
+            &preimage_boolean[..],
+        )?;
+
+        Ok((Self::new(allocated_nums), computed_commitment))
+    }
 
     fn includes<A, AR, CS: ConstraintSystem<E>>(
         &self,
@@ -22,12 +57,56 @@ pub trait ApexCommitment<E: Engine> {
 }
 
 #[derive(Clone)]
-pub enum BinaryApexCommitment<E: Engine> {
+pub enum BinaryApexCommitment<E: JubjubEngine> {
     Leaf(AllocatedNum<E>),
     Branch(Box<BinaryApexCommitment<E>>, Box<BinaryApexCommitment<E>>),
 }
 
-impl<E: Engine> BinaryApexCommitment<E> {
+impl<E: JubjubEngine> ApexCommitment<E> for BinaryApexCommitment<E> {
+    #[allow(dead_code)]
+    fn new(allocated_nums: &[AllocatedNum<E>]) -> Self {
+        let commitments = allocated_nums;
+
+        let size = allocated_nums.len();
+        assert!(size > 0, "BinaryCommitment must not be empty.");
+
+        if size == 1 {
+            return BinaryApexCommitment::Leaf(commitments[0].clone());
+        }
+
+        assert_eq!(
+            size.count_ones(),
+            1,
+            "BinaryCommitment size must be a power of two."
+        );
+
+        let half_size = size / 2;
+        let left = Self::new(&commitments[0..half_size]);
+        let right = Self::new(&commitments[half_size..]);
+
+        BinaryApexCommitment::Branch(Box::new(left), Box::new(right))
+    }
+
+    // Initial recursive implementation of `includes` which generates (too) many constraints.
+    fn includes<A, AR, CS: ConstraintSystem<E>>(
+        &self,
+        cs: &mut CS,
+        annotation: A,
+        num: &num::AllocatedNum<E>,
+        path: &[Boolean],
+    ) -> Result<(), SynthesisError>
+    where
+        A: FnOnce() -> AR,
+        AR: Into<String>,
+    {
+        let cs = &mut cs.namespace(|| "binary_commitment_inclusion");
+        let num_at_path = self.at_path(cs, path)?;
+
+        Ok(constraint::equal(cs, annotation, num, &num_at_path))
+    }
+}
+
+impl<E: JubjubEngine> BinaryApexCommitment<E> {
     fn at_path<CS: ConstraintSystem<E>>(
         &self,
         cs: &mut CS,
@@ -80,55 +159,11 @@ impl<E: Engine> BinaryApexCommitment<E> {
     }
 }
 
-impl<E: Engine> ApexCommitment<E> for BinaryApexCommitment<E> {
-    #[allow(dead_code)]
-    fn new(allocated_nums: &[AllocatedNum<E>]) -> Self {
-        let commitments = allocated_nums;
-
-        let size = allocated_nums.len();
-        assert!(size > 0, "BinaryCommitment must not be empty.");
-
-        if size == 1 {
-            return BinaryApexCommitment::Leaf(commitments[0].clone());
-        }
-
-        assert_eq!(
-            size.count_ones(),
-            1,
-            "BinaryCommitment size must be a power of two."
-        );
-
-        let half_size = size / 2;
-        let left = Self::new(&commitments[0..half_size]);
-        let right = Self::new(&commitments[half_size..]);
-
-        BinaryApexCommitment::Branch(Box::new(left), Box::new(right))
-    }
-
-    // Initial recursive implementation of `includes` which generates (too) many constraints.
-    fn includes<A, AR, CS: ConstraintSystem<E>>(
-        &self,
-        cs: &mut CS,
-        annotation: A,
-        num: &num::AllocatedNum<E>,
-        path: &[Boolean],
-    ) -> Result<(), SynthesisError>
-    where
-        A: FnOnce() -> AR,
-        AR: Into<String>,
-    {
-        let cs = &mut cs.namespace(|| "binary_commitment_inclusion");
-        let num_at_path = self.at_path(cs, path)?;
-
-        Ok(equal(cs, annotation, num, &num_at_path))
-    }
-}
-
-pub struct FlatApexCommitment<E: Engine> {
+pub struct FlatApexCommitment<E: JubjubEngine> {
     allocated_nums: Vec<AllocatedNum<E>>,
 }
 
-impl<E: Engine> ApexCommitment<E> for FlatApexCommitment<E> {
+impl<E: JubjubEngine> ApexCommitment<E> for FlatApexCommitment<E> {
     fn new(allocated_nums: &[AllocatedNum<E>]) -> Self {
         assert_eq!(allocated_nums.len().count_ones(), 1);
         FlatApexCommitment::<E> {
@@ -152,7 +187,12 @@ impl<E: Engine> ApexCommitment<E> for FlatApexCommitment<E> {
         if path.is_empty() {
             assert_eq!(size, 1);
 
-            Ok(equal(cs, annotation, num, &self.allocated_nums[0]))
+            Ok(constraint::equal(
+                cs,
+                annotation,
+                num,
+                &self.allocated_nums[0],
+            ))
         } else {
             let reduced_size = size / 2; // Must divide evenly because size must be power of 2.
             let mut new_allocated = Vec::with_capacity(reduced_size);
@@ -173,10 +213,7 @@ impl<E: Engine> ApexCommitment<E> for FlatApexCommitment<E> {
                 let right = &self.allocated_nums[i + reduced_size];
                 let (xl, _xr) = num::AllocatedNum::conditionally_reverse(
                     cs.namespace(|| {
-                        format!(
-                            "conditional reversal of FlatBinaryCommitment elements ({})",
-                            i
-                        )
+                        format!("conditional reversal of FlatCommitment elements ({})", i)
                     }),
                     &left,
                     &right,
@@ -196,15 +233,20 @@ impl<E: Engine> ApexCommitment<E> for FlatApexCommitment<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::circuit::test::TestConstraintSystem;
     use bellman::ConstraintSystem;
     use pairing::bls12_381::Bls12;
     use pairing::Engine;
     use rand::{Rng, SeedableRng, XorShiftRng};
     use sapling_crypto::circuit::boolean::{AllocatedBit, Boolean};
     use sapling_crypto::circuit::num::AllocatedNum;
+    use sapling_crypto::jubjub::JubjubBls12;
 
-    fn path_from_index<E: Engine, CS: ConstraintSystem<E>>(
+    use crate::circuit::constraint;
+    use crate::circuit::test::TestConstraintSystem;
+    use crate::crypto;
+    use crate::fr32::fr_into_bytes;
+
+    fn path_from_index<E: JubjubEngine, CS: ConstraintSystem<E>>(
         cs: &mut CS,
         index: usize,
         size: usize,
@@ -227,66 +269,46 @@ mod tests {
         path
     }
 
-    // How many constraints?
-    //
-    // Experimentally, we know:
-    // size 1,   n = 0 -> 1
-    // size 2,   n = 1 -> 8
-    // size 4,   n = 2 -> 36
-    // size 8,   n = 3 -> 144
-    // size 16,  n = 4 -> 560
-    // size 32,  n = 5 -> 2176
-    // size 64,  n = 6 -> 8152
-    // size 128, n = 7 -> 3356
-    //
-    // Algorithm:
-    //   size 2^n, n = n
-    //   constraints(n) -> (2^n * n) + ((2^n+1 - 1) * 2^n)
-    //
-    // Example calculations:
-    // n = 0; 1 + 0                = 1
-    // n = 1; 2 + (4-1)*2          = 8
-    // n = 2; 4 * 2 + (8-1)*4      = 36
-    // n = 3; 8 * 3 + (16-1)*8     = 144
-    // n = 4; 16 * 4 + (32-1) * 16 = 560
-    // n = 8; 32 * 5 + (64-1) * 32 = 2176
-    //
-    // TODO: The actual complexity of per-test constraint-generation should be O(2^n).
-    // Conceptually, we need to convert the constraint-generation from un-memoized recursion
-    // to dynamic programming. However, we don't have real conditionals. Working only with the
-    // swap-if primitive (which we do have), we can't do that in the obvious way.
-    //
-    // However, there is a really pretty way to achieve the same result by repeatedly transforming
-    // the apex leaves as we walk toward the root.
-    //
-    // Implement that.
-    fn constraints(n: usize) -> usize {
-        let two_to_the_n = 1 << n;
-        let two_to_the_n_plus_one = 2 * two_to_the_n;
-
-        (two_to_the_n * n) + (two_to_the_n_plus_one - 1) * two_to_the_n
-    }
-
     fn test_apex_commitment_circuit<T: ApexCommitment<Bls12>>() {
         let mut rng = XorShiftRng::from_seed([0x5dbe6259, 0x8d313d76, 0x3237db17, 0xe5bc0654]);
         let max_len = 8;
+        let params = JubjubBls12::new();
 
-        for n in 0..max_len {
+        for n in 1..max_len {
             let size = 1 << n;
             let mut outer_cs = TestConstraintSystem::<Bls12>::new();
             let mut nums = Vec::with_capacity(size);
+            let mut bytes = Vec::<u8>::with_capacity(size);
             for i in 0..size {
                 let val: <Bls12 as Engine>::Fr = rng.gen();
                 let cs = &mut outer_cs.namespace(|| format!("num-{}", i));
                 let num = AllocatedNum::alloc(cs, || Ok(val)).unwrap();
 
+                bytes.extend(fr_into_bytes::<Bls12>(&val));
                 nums.push(num);
             }
 
-            let bc = T::new(&nums);
+            let non_circuit_calculated_root =
+                crypto::pedersen::pedersen_md_no_padding(bytes.as_slice());
+            let allocated_root =
+                AllocatedNum::alloc(outer_cs.namespace(|| "allocated_root"), || {
+                    Ok(non_circuit_calculated_root)
+                })
+                .unwrap();
+
+            let (bc, root) =
+                T::commit(&mut outer_cs.namespace(|| "apex_commit"), &nums, &params).unwrap();
+
+            constraint::equal(
+                &mut outer_cs,
+                //&mut outer_cs.namespace(|| "root check"),
+                || "enforce roots are equal",
+                &root,
+                &allocated_root,
+            );
 
             for (i, num) in nums.iter().enumerate() {
-                let mut starting_constraints = outer_cs.num_constraints();
+                let starting_constraints = outer_cs.num_constraints();
                 {
                     let cs = &mut outer_cs.namespace(|| format!("test index {}", i));
                     let path = path_from_index(cs, i, n);
@@ -307,10 +329,8 @@ mod tests {
                 //  This is (2 * size + length) - 1 = (2^L + L) - 1.
                 let expected_inclusion_constraints = (2 * size + n) - 1;
                 assert_eq!(num_constraints, expected_inclusion_constraints);
-                starting_constraints = num_constraints;
             }
 
-            assert_eq!(outer_cs.num_constraints(), constraints(n));
             assert!(outer_cs.is_satisfied(), "constraints not satisfied");
         }
     }
