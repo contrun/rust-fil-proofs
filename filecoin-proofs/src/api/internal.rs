@@ -149,7 +149,7 @@ fn get_post_params(
     let post_public_params = post_public_params(sector_bytes);
 
     let get_params = || {
-        <VDFPostCompound as CompoundProof<
+        <VDFPostCompound<PedersenHasher> as CompoundProof<
             Bls12,
             VDFPoSt<PedersenHasher, Sloth>,
             VDFPoStCircuit<Bls12>,
@@ -183,7 +183,7 @@ fn get_post_verifying_key(
     let post_public_params = post_public_params(sector_bytes);
 
     let get_verifying_key = || {
-        <VDFPostCompound as CompoundProof<
+        <VDFPostCompound<PedersenHasher> as CompoundProof<
             Bls12,
             VDFPoSt<PedersenHasher, Sloth>,
             VDFPoStCircuit<Bls12>,
